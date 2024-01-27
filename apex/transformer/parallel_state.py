@@ -17,7 +17,7 @@
 """Model and data parallel groups."""
 from typing import Tuple, Optional
 import warnings
-
+import os
 import torch
 
 from apex.transformer.log_util import get_transformer_logger
@@ -49,7 +49,7 @@ _DECODER_RELATIVE_POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 # Data parallel AMAX reduction group that the current rank belongs to.
-_DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION = None
+_AMAX_REDUCTION_GROUP = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
@@ -80,6 +80,77 @@ def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is None
 
+def set_nccl_socket_envs():
+    if os.getenv("NCCL_SOCKET_IFNAME") is None:
+        raise RuntimeError("NCCL_SOCKET_IFNAME was not set")
+    os.environ["NCCL_NET"] = "Socket"
+
+def set_nccl_ib_envs():
+    os.environ["NCCL_NET"] = "IB"
+
+def init_nccl_net(group):
+    temp = torch.ones(1, device="cuda")
+    torch.distributed.all_reduce(temp, group=group)
+    torch.cuda.synchronize()
+
+def new_nccl_socket_group(ranks):
+    set_nccl_socket_envs()
+    group = torch.distributed.new_group(ranks, backend="nccl")
+    init_nccl_net(group=group)
+    return group
+
+def new_nccl_ib_group(ranks):
+    set_nccl_ib_envs()
+    group = torch.distributed.new_group(ranks, backend="nccl")
+    init_nccl_net(group=group)
+    return group
+
+def new_process_group(ranks, backend):
+    """
+    This function creates process groups.
+
+    In addition to simply creating the process groups, it initializes NCCL
+    for hybrid IB/Socket network like in the following diagram:
+
+                            ____________
+      [GPU Node 0]---TCP---|            |---TCP---[GPU Node 2]
+         |                 |            |            |
+         |                 |            |            |
+        IB                 | IP Network |           IB
+         |                 |            |            |
+         |                 |            |            |
+      [GPU Node 1]---TCP---|____________|---TCP---[GPU Node 3]
+
+
+    If an environment variable NUM_GPUS_PER_IB_BLOCK is defined it looks up the ranks
+    and determines whether the list of ranks belong to the same computational block where
+    GPUs nodes are interconnected via IB type of connection or not.
+    If all ranks are in the same block, the process group will use NCCL_NET=IB for
+    communication, otherwise it will use NCCL_NET=Socket.
+
+    If NCCL_NET=Socket is ever to be used, the user must set NCCL_SOCKET_IFNAME.
+    Additionally, it is recommended to set NCCL_SOCKET_NTHREADS and
+    NCCL_NSOCKS_PERTHREAD before running the job.
+    See: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
+    for more info
+
+    The core assumption for this functionality is that the ranks are evenly divided
+    into IB blocks and all these IB blocks are of the same size.
+    """
+    if backend is None:
+        backend = "nccl"
+
+    compute_block_size = os.getenv("NUM_GPUS_PER_IB_BLOCK")
+    if backend == "nccl" and compute_block_size is not None:
+        compute_block_size = int(compute_block_size)
+        blocks = [rank // compute_block_size for rank in ranks]
+        use_ib = all(block == blocks[0] for block in blocks)
+        if use_ib:
+            return new_nccl_ib_group(ranks)
+        else:
+            return new_nccl_socket_group(ranks)
+    else:
+        return torch.distributed.new_group(ranks, backend=backend)
 
 def initialize_model_parallel(
     tensor_model_parallel_size_: int = 1,
@@ -87,6 +158,7 @@ def initialize_model_parallel(
     virtual_pipeline_model_parallel_size_: Optional[int] = None,
     pipeline_model_parallel_split_rank_: Optional[int] = None,
     use_fp8_: bool = False,
+    init_mpi_proc_group: bool = False,
     *,
     default_backend: Optional[str] = None,
     p2p_backend: Optional[str] = None,
@@ -100,6 +172,7 @@ def initialize_model_parallel(
         virtual_pipeline_model_parallel_size: number of virtual stages (interleaved pipeline).
         pipeline_model_parallel_split_rank: for models with both encoder and decoder, rank in pipeline with split point.
         use_fp8_: FP8 training that needs AMAX reduction across data-parallel ranks.
+        init_mpi_proc_group: Create a MPI process group, which is used for UCX-based communication APIs.
     Keyword Arguments:
         default_backend: Backend of process groups except for pipeline parallel ones.
             If :obj:`None`, the backend specified in `torch.distributed.init_process_group` will be used.
@@ -136,6 +209,9 @@ def initialize_model_parallel(
         warnings.warn("`ucc` backend support is experimental", ExperimentalWarning)
     if default_backend == "ucc":
         warnings.warn("The UCC's functionality as `default_backend` is not well verified", ExperimentalWarning)
+
+    # Saving the NCCL_NET type for reusing it at the epilogue 
+    default_nccl_net = os.getenv("NCCL_NET")
 
     world_size: int = torch.distributed.get_world_size()
     tensor_model_parallel_size: int = min(tensor_model_parallel_size_, world_size)
@@ -190,9 +266,6 @@ def initialize_model_parallel(
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
-    if use_fp8_:
-        global _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION
-        assert _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION is None, "amax reduction group is already initialized"
     all_data_parallel_group_ranks = []
     for i in range(pipeline_model_parallel_size):
         start_rank = i * num_pipeline_model_parallel_groups
@@ -200,13 +273,23 @@ def initialize_model_parallel(
         for j in range(tensor_model_parallel_size):
             ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
             all_data_parallel_group_ranks.append(list(ranks))
-            group = torch.distributed.new_group(ranks, backend=default_backend)
+            group = new_process_group(ranks, backend=default_backend)
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
-            if use_fp8_:
-                group = torch.distributed.new_group(ranks, backend=default_backend)
-                if rank in ranks:
-                    _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION = group
+
+    # Build the amax-reduction groups for fp8 precision conversion.
+    if use_fp8_:
+        global _AMAX_REDUCTION_GROUP
+        assert _AMAX_REDUCTION_GROUP is None, "amax reduction group is already initialized"
+        amax_group_size: int = tensor_model_parallel_size * data_parallel_size
+        num_amax_groups: int = world_size // amax_group_size
+        for i in range(num_amax_groups):
+            start_rank = i * amax_group_size
+            end_rank = (i + 1) * amax_group_size
+            ranks = range(start_rank, end_rank)
+            group = torch.distributed.new_group(ranks, backend=default_backend)
+            if rank in ranks:
+                _AMAX_REDUCTION_GROUP = group
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -216,7 +299,7 @@ def initialize_model_parallel(
             data_parallel_group_ranks[i]
             for data_parallel_group_ranks in all_data_parallel_group_ranks
         ]
-        group = torch.distributed.new_group(ranks, backend=default_backend)
+        group = new_process_group(ranks, backend=default_backend)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
@@ -229,7 +312,7 @@ def initialize_model_parallel(
         ranks = list(
             range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         )
-        group = torch.distributed.new_group(ranks, backend=default_backend)
+        group = new_process_group(ranks, backend=default_backend)
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
 
@@ -257,7 +340,7 @@ def initialize_model_parallel(
         'relative position embedding group is already initialized'
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
-        group = torch.distributed.new_group(ranks, backend=p2p_backend)
+        group = new_process_group(ranks, backend=p2p_backend)
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
@@ -295,20 +378,20 @@ def initialize_model_parallel(
             encoder_relative_position_embedding_ranks = ranks
             decoder_relative_position_embedding_ranks = ranks
 
-        group = torch.distributed.new_group(embedding_ranks, backend=default_backend)
+        group = new_process_group(embedding_ranks, backend=p2p_backend)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
         if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        group = torch.distributed.new_group(position_embedding_ranks, backend=default_backend)
+        group = new_process_group(position_embedding_ranks, backend=p2p_backend)
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
         if encoder_relative_position_embedding_ranks:
-            group = torch.distributed.new_group(encoder_relative_position_embedding_ranks)
+            group = new_process_group(encoder_relative_position_embedding_ranks, backend=p2p_backend)
         if rank in encoder_relative_position_embedding_ranks:
             _ENCODER_RELATIVE_POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
@@ -316,12 +399,24 @@ def initialize_model_parallel(
                 encoder_relative_position_embedding_ranks
 
         if decoder_relative_position_embedding_ranks:
-            group = torch.distributed.new_group(decoder_relative_position_embedding_ranks)
+            group = new_process_group(decoder_relative_position_embedding_ranks, backend=p2p_backend)
         if rank in decoder_relative_position_embedding_ranks:
             _DECODER_RELATIVE_POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
             _DECODER_RELATIVE_POSITION_EMBEDDING_GLOBAL_RANKS = \
                 decoder_relative_position_embedding_ranks
+
+    if init_mpi_proc_group:
+        torch.distributed.new_group(backend='mpi')
+
+    if default_nccl_net == "Socket":
+        set_nccl_socket_envs()
+    elif default_nccl_net == "IB":
+        set_nccl_ib_envs()
+    elif default_nccl_net is None:
+        os.unsetenv("NCCL_NET")
+    else:
+        os.environ["NCCL_NET"] = default_nccl_net
 
 def get_rank_info() -> Tuple[int, int, int]:
     """Returns a tuple of (data, tensor, pipeline, virtual pipeline)-parallel-rank for logger."""
@@ -374,11 +469,11 @@ def get_data_parallel_group():
     return _DATA_PARALLEL_GROUP
 
 
-def get_data_parallel_amax_reduction_group():
+def get_amax_reduction_group():
     """Get the amax reduction group the caller rank belongs to."""
-    assert _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION is not None, \
+    assert _AMAX_REDUCTION_GROUP is not None, \
         "AMAX reduction group is not initialized"
-    return _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION
+    return _AMAX_REDUCTION_GROUP
 
 
 def get_embedding_group():
@@ -673,8 +768,8 @@ def destroy_model_parallel():
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
-    global _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION
-    _DATA_PARALLEL_GROUP_FOR_AMAX_REDUCTION = None
+    global _AMAX_REDUCTION_GROUP
+    _AMAX_REDUCTION_GROUP = None
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
     global _POSITION_EMBEDDING_GROUP
